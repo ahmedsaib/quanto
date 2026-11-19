@@ -84,26 +84,59 @@ class QuantumClassifier:
 
 
 class MatchedHead:
-    """4 -> tanh(1) -> softmax(K); 5+2K trainable values; same 100 COBYLA calls."""
-    def __init__(self,labels=('alfalfa','maize','wheat'),max_evals=100):
-        self.labels=np.asarray(labels);self.max_evals=max_evals
+    """Multinomial logistic regression control: D -> softmax(K) with L-BFGS-B."""
+    def __init__(self, labels=('alfalfa', 'maize', 'wheat'), max_evals=100, use_bias=True):
+        self.labels = np.asarray(labels)
+        self.max_evals = max_evals
+        self.use_bias = use_bias
 
-    def _proba(self,X,w):
-        hidden=np.tanh(X@w[:4]+w[4]); k=len(self.labels)
-        return softmax(hidden[:,None]*w[5:5+k]+w[5+k:],axis=1)
+    def _proba(self, X, w):
+        d = X.shape[1]
+        k = len(self.labels)
+        W = w[:d * k].reshape(d, k)
+        logits = X @ W
+        if self.use_bias:
+            logits = logits + w[d * k:]
+        return softmax(logits, axis=1)
 
-    def fit(self,X_train,y_train,seed=0):
-        X=np.asarray(X_train); y=np.array([np.flatnonzero(self.labels==v)[0] for v in y_train]); start=perf_counter();self.history=[]
+    def fit(self, X_train, y_train, seed=0):
+        X = np.asarray(X_train, dtype=float)
+        y = np.array([np.flatnonzero(self.labels == v)[0] for v in y_train])
+        d, k = X.shape[1], len(self.labels)
+        n_params = d * k + (k if self.use_bias else 0)
+
+        start = perf_counter()
+        self.history = []
+
         def objective(w):
-            p=self._proba(X,w);loss=-np.log(np.maximum(p[np.arange(len(y)),y],1e-15)).mean()
-            self.history.append(dict(evaluation=len(self.history)+1,objective=float(loss),seconds=perf_counter()-start))
+            p = self._proba(X, w)
+            loss = -np.log(np.maximum(p[np.arange(len(y)), y], 1e-15)).mean()
+            self.history.append(dict(
+                evaluation=len(self.history) + 1,
+                objective=float(loss),
+                seconds=perf_counter() - start
+            ))
             return loss
-        res=minimize(objective,np.random.default_rng(seed).normal(0,.3,5+2*len(self.labels)),method='COBYLA',options={'maxiter':self.max_evals})
-        self.weights=res.x;self.fit_seconds=perf_counter()-start;return self
 
-    def predict_proba(self,X):
-        return probabilities(self._proba(np.asarray(X),self.weights),len(X),len(self.labels))
+        init_w = np.random.default_rng(seed).normal(0, 0.3, n_params)
+        res = minimize(
+            objective,
+            init_w,
+            method='L-BFGS-B',
+            options={'maxfun': self.max_evals}
+        )
+        self.weights = res.x
+        self.fit_seconds = perf_counter() - start
+        return self
 
-    def predict(self,X): return self.labels[self.predict_proba(X).argmax(axis=1)]
+    def predict_proba(self, X):
+        return probabilities(self._proba(np.asarray(X, dtype=float), self.weights), len(X), len(self.labels))
 
-    def resources(self): return dict(trainable=len(self.weights),objective_evaluations=len(self.history))
+    def predict(self, X):
+        return self.labels[self.predict_proba(X).argmax(axis=1)]
+
+    def resources(self):
+        return dict(
+            trainable=len(self.weights),
+            objective_evaluations=len(self.history)
+        )
