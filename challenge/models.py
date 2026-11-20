@@ -21,29 +21,46 @@ def angles(X):
     return (np.pi/2)*(1+np.tanh(X))
 
 
-def make_circuit(encoding_name='zz'):
-    if encoding_name == 'ry':
-        encoding=QuantumCircuit(4)
-        x=ParameterVector('x',4)
-        for i in range(4): encoding.ry(x[i],i)
-    elif encoding_name == 'zz':
-        encoding=zz_feature_map(4,reps=1,entanglement='linear',parameter_prefix='x')
-    else: raise ValueError('Unknown encoding')
-    ansatz=real_amplitudes(4,reps=1,entanglement='linear',parameter_prefix='theta')
-    return encoding.compose(ansatz),tuple(encoding.parameters),tuple(ansatz.parameters)
+def make_circuit(encoding_name='ry', reps=1):
+    x = ParameterVector('x', 4)
+    qc = QuantumCircuit(4)
+    weight_params = []
 
+    for r in range(reps):
+        if encoding_name == 'ry':
+            for i in range(4):
+                qc.ry(x[i], i)
+        elif encoding_name == 'zz':
+            enc = zz_feature_map(4, reps=1, entanglement='linear', parameter_prefix=f'x_r{r}')
+            enc = enc.assign_parameters(dict(zip(enc.parameters, x)))
+            qc.compose(enc, inplace=True)
+        else:
+            raise ValueError('Unknown encoding')
+
+        ansatz = real_amplitudes(4, reps=1, entanglement='linear', parameter_prefix=f'theta_{r}')
+        weight_params.extend(ansatz.parameters)
+        qc.compose(ansatz, inplace=True)
+
+    return qc, tuple(x), tuple(weight_params)
 
 class QuantumClassifier:
-    def __init__(self, labels=('alfalfa','maize','wheat'), max_evals=100, encoding='ry'):
-        self.labels=np.asarray(labels); self.max_evals=max_evals
-        self.encoding=encoding
-        self.circuit,self.inputs,self.weights=make_circuit(encoding)
-        k=len(self.labels)
-        self.outcomes=np.array([int(i).bit_count()%2 if encoding=='ry' and k==2 else i%k for i in range(16)])
-        self.qnn=SamplerQNN(circuit=self.circuit,sampler=QMLSampler(shots=None),
-                            input_params=self.inputs,weight_params=self.weights,
-                            interpret=lambda outcome:int(self.outcomes[int(outcome)]),output_shape=k)
-        self.history=[]
+    def __init__(self, labels=('alfalfa', 'maize', 'wheat'), max_evals=100, encoding='ry', reps=1):
+        self.labels = np.asarray(labels)
+        self.max_evals = max_evals
+        self.encoding = encoding
+        self.reps = reps
+        self.circuit, self.inputs, self.weights = make_circuit(encoding, reps=reps)
+        k = len(self.labels)
+        self.outcomes = np.array([int(i).bit_count() % 2 if encoding == 'ry' and k == 2 else i % k for i in range(16)])
+        self.qnn = SamplerQNN(
+            circuit=self.circuit,
+            sampler=QMLSampler(shots=None),
+            input_params=self.inputs,
+            weight_params=self.weights,
+            interpret=lambda outcome: int(self.outcomes[int(outcome)]),
+            output_shape=k
+        )
+        self.history = []
 
     def fit(self,X_train,y_train,seed=0):
         y=np.asarray(y_train)
@@ -77,10 +94,18 @@ class QuantumClassifier:
         return p
 
     def resources(self):
-        return dict(qubits=4,trainable=len(self.weights),frozen_quantum=0,depth=self.circuit.depth(),
-                    two_qubit_gates=sum(len(i.qubits)==2 for i in self.circuit.data),
-                    objective_evaluations=len(self.history),readout_group_sizes=np.bincount(self.outcomes).tolist(),encoding=self.encoding,
-                    compilation='logical decomposed H/P/RY/CX; no backend routing')
+        return dict(
+            qubits=4,
+            reps=self.reps,
+            trainable=len(self.weights),
+            frozen_quantum=0,
+            depth=self.circuit.depth(),
+            two_qubit_gates=sum(len(i.qubits) == 2 for i in self.circuit.data),
+            objective_evaluations=len(self.history),
+            readout_group_sizes=np.bincount(self.outcomes).tolist(),
+            encoding=self.encoding,
+            compilation='logical decomposed H/P/RY/CX; no backend routing'
+        )
 
 
 class MatchedHead:
