@@ -3,6 +3,7 @@ from time import perf_counter
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import softmax
+from sklearn.svm import SVC
 from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
 from qiskit.circuit.library import zz_feature_map, real_amplitudes
@@ -15,10 +16,10 @@ from .metrics import probabilities
 
 
 def angles(X):
-    X=np.asarray(X,dtype=float)
-    if X.ndim!=2 or X.shape[1]!=4 or not np.isfinite(X).all():
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2 or X.shape[1] != 4 or not np.isfinite(X).all():
         raise ValueError('Expected a finite (n,4) prepared view')
-    return (np.pi/2)*(1+np.tanh(X))
+    return (np.pi / 2) * (1 + np.tanh(X))
 
 
 def make_circuit(encoding_name='ry', reps=1):
@@ -43,6 +44,7 @@ def make_circuit(encoding_name='ry', reps=1):
 
     return qc, tuple(x), tuple(weight_params)
 
+
 class QuantumClassifier:
     def __init__(self, labels=('alfalfa', 'maize', 'wheat'), max_evals=100, encoding='ry', reps=1):
         self.labels = np.asarray(labels)
@@ -62,35 +64,42 @@ class QuantumClassifier:
         )
         self.history = []
 
-    def fit(self,X_train,y_train,seed=0):
-        y=np.asarray(y_train)
-        if set(y)!=set(self.labels): raise ValueError('Training must contain every declared class')
-        encoded=np.array([np.flatnonzero(self.labels==v)[0] for v in y])
-        start=perf_counter(); self.history=[]
-        def callback(weights,objective):
-            self.history.append(dict(evaluation=len(self.history)+1,objective=float(objective),seconds=perf_counter()-start))
-        self.model=NeuralNetworkClassifier(self.qnn,one_hot=True,loss='cross_entropy',
-            optimizer=COBYLA(maxiter=self.max_evals),callback=callback,
-            initial_point=np.random.default_rng(seed).uniform(-np.pi,np.pi,len(self.weights)))
-        self.model.fit(angles(X_train),np.eye(len(self.labels))[encoded])
-        self.fit_seconds=perf_counter()-start
+    def fit(self, X_train, y_train, seed=0):
+        y = np.asarray(y_train)
+        if set(y) != set(self.labels):
+            raise ValueError('Training must contain every declared class')
+        encoded = np.array([np.flatnonzero(self.labels == v)[0] for v in y])
+        start = perf_counter()
+        self.history = []
+
+        def callback(weights, objective):
+            self.history.append(dict(evaluation=len(self.history) + 1, objective=float(objective), seconds=perf_counter() - start))
+
+        self.model = NeuralNetworkClassifier(
+            self.qnn, one_hot=True, loss='cross_entropy',
+            optimizer=COBYLA(maxiter=self.max_evals), callback=callback,
+            initial_point=np.random.default_rng(seed).uniform(-np.pi, np.pi, len(self.weights))
+        )
+        self.model.fit(angles(X_train), np.eye(len(self.labels))[encoded])
+        self.fit_seconds = perf_counter() - start
         return self
 
-    def predict_proba(self,X):
-        return probabilities(self.qnn.forward(angles(X),self.model.weights),len(X),len(self.labels))
+    def predict_proba(self, X):
+        return probabilities(self.qnn.forward(angles(X), self.model.weights), len(X), len(self.labels))
 
-    def predict(self,X):
+    def predict(self, X):
         return self.labels[self.predict_proba(X).argmax(axis=1)]
 
-    def bound_circuit(self,row,weights=None):
-        if weights is None: weights=self.model.weights
-        bind=dict(zip(self.inputs,angles(np.asarray(row).reshape(1,4))[0]))
-        bind.update(zip(self.weights,weights))
+    def bound_circuit(self, row, weights=None):
+        if weights is None:
+            weights = self.model.weights
+        bind = dict(zip(self.inputs, angles(np.asarray(row).reshape(1, 4))[0]))
+        bind.update(zip(self.weights, weights))
         return self.circuit.assign_parameters(bind)
 
-    def ideal_proba(self,row,weights=None):
-        state=Statevector.from_instruction(self.bound_circuit(row,weights))
-        p=np.bincount(self.outcomes,weights=state.probabilities(),minlength=len(self.labels))
+    def ideal_proba(self, row, weights=None):
+        state = Statevector.from_instruction(self.bound_circuit(row, weights))
+        p = np.bincount(self.outcomes, weights=state.probabilities(), minlength=len(self.labels))
         return p
 
     def resources(self):
@@ -108,27 +117,90 @@ class QuantumClassifier:
         )
 
 
+class QuantumKernelClassifier:
+    """4-qubit RY Fidelity Quantum Kernel + Classical SVM."""
+    def __init__(self, labels=('alfalfa', 'maize', 'wheat'), C=0.25):
+        self.labels = np.asarray(labels)
+        self.C = C
+        qc = QuantumCircuit(4)
+        x = ParameterVector('x', 4)
+        for i in range(4):
+            qc.ry(x[i], i)
+        self.circuit = qc
+        self.svm = None
+        self._train_states = None
+
+    def _states(self, X):
+        X_ang = angles(X)
+        return np.array([
+            Statevector.from_instruction(self.circuit.assign_parameters(row)).data
+            for row in X_ang
+        ])
+
+    def fit(self, X_train, y_train, seed=0):
+        self._train_states = self._states(X_train)
+        K_train = np.abs(self._train_states @ self._train_states.conj().T) ** 2
+        self.svm = SVC(kernel='precomputed', C=self.C, probability=True, random_state=seed)
+        self.svm.fit(K_train, y_train)
+        return self
+
+    def predict_proba(self, X):
+        states = self._states(X)
+        K_test = np.abs(states @ self._train_states.conj().T) ** 2
+        raw = self.svm.predict_proba(K_test)
+        # Align columns to self.labels order: ['alfalfa', 'maize', 'wheat']
+        col_idx = [list(self.svm.classes_).index(lbl) for lbl in self.labels]
+        return probabilities(raw[:, col_idx], len(X), len(self.labels))
+
+    def predict(self, X):
+        states = self._states(X)
+        K_test = np.abs(states @ self._train_states.conj().T) ** 2
+        return self.svm.predict(K_test)
+
+    def resources(self):
+        return dict(
+            qubits=4,
+            trainable=0,
+            depth=self.circuit.depth(),
+            two_qubit_gates=sum(len(i.qubits) == 2 for i in self.circuit.data),
+            encoding='ry_kernel',
+            C=self.C,
+        )
+
+
 class MatchedHead:
     """4 -> tanh(1) -> softmax(K); 5+2K trainable values; same 100 COBYLA calls."""
-    def __init__(self,labels=('alfalfa','maize','wheat'),max_evals=100):
-        self.labels=np.asarray(labels);self.max_evals=max_evals
+    def __init__(self, labels=('alfalfa', 'maize', 'wheat'), max_evals=100):
+        self.labels = np.asarray(labels)
+        self.max_evals = max_evals
 
-    def _proba(self,X,w):
-        hidden=np.tanh(X@w[:4]+w[4]); k=len(self.labels)
-        return softmax(hidden[:,None]*w[5:5+k]+w[5+k:],axis=1)
+    def _proba(self, X, w):
+        hidden = np.tanh(X @ w[:4] + w[4])
+        k = len(self.labels)
+        return softmax(hidden[:, None] * w[5:5 + k] + w[5 + k:], axis=1)
 
-    def fit(self,X_train,y_train,seed=0):
-        X=np.asarray(X_train); y=np.array([np.flatnonzero(self.labels==v)[0] for v in y_train]); start=perf_counter();self.history=[]
+    def fit(self, X_train, y_train, seed=0):
+        X = np.asarray(X_train)
+        y = np.array([np.flatnonzero(self.labels == v)[0] for v in y_train])
+        start = perf_counter()
+        self.history = []
+
         def objective(w):
-            p=self._proba(X,w);loss=-np.log(np.maximum(p[np.arange(len(y)),y],1e-15)).mean()
-            self.history.append(dict(evaluation=len(self.history)+1,objective=float(loss),seconds=perf_counter()-start))
+            p = self._proba(X, w)
+            loss = -np.log(np.maximum(p[np.arange(len(y)), y], 1e-15)).mean()
+            self.history.append(dict(evaluation=len(self.history) + 1, objective=float(loss), seconds=perf_counter() - start))
             return loss
-        res=minimize(objective,np.random.default_rng(seed).normal(0,.3,5+2*len(self.labels)),method='COBYLA',options={'maxiter':self.max_evals})
-        self.weights=res.x;self.fit_seconds=perf_counter()-start;return self
 
-    def predict_proba(self,X):
-        return probabilities(self._proba(np.asarray(X),self.weights),len(X),len(self.labels))
+        res = minimize(objective, np.random.default_rng(seed).normal(0, .3, 5 + 2 * len(self.labels)), method='COBYLA', options={'maxiter': self.max_evals})
+        self.weights = res.x
+        self.fit_seconds = perf_counter() - start
+        return self
 
-    def predict(self,X): return self.labels[self.predict_proba(X).argmax(axis=1)]
+    def predict_proba(self, X):
+        return probabilities(self._proba(np.asarray(X), self.weights), len(X), len(self.labels))
 
-    def resources(self): return dict(trainable=len(self.weights),objective_evaluations=len(self.history))
+    def predict(self, X):
+        return self.labels[self.predict_proba(X).argmax(axis=1)]
+
+    def resources(self):
+        return dict(trainable=len(self.weights), objective_evaluations=len(self.history))
